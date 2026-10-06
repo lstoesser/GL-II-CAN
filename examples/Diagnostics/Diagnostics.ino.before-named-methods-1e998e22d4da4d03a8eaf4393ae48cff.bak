@@ -1,0 +1,117 @@
+#include <gl-ii-CAN.h>
+using namespace glii;
+
+Config makeConfig() {
+  Config c;
+  c.txPin = GPIO_NUM_17;
+  c.rxPin = GPIO_NUM_18;
+  c.bitrate = 1000000;
+  c.motorId = 1;
+  c.feedbackId = 0; // Verify using raw RX log. It may differ from motorId.
+  c.positionVelocityId = 1; // Verify mode-specific IDs before using these commands.
+  c.velocityId = 1;
+  c.positionRange = 12.5f;
+  c.velocityRange = 30.0f; // Use 200 only if that is the motor's configured range.
+  c.torqueRange = 10.0f;
+  return c;
+}
+const Config motorConfig = makeConfig();
+GLIICAN motor(motorConfig);
+void serviceMotor();
+struct MotorUserData {
+  MotorFeedback lastFeedback;
+  bool receivedFeedback = false;
+  uint32_t lastFeedbackMs = 0;
+};
+MotorUserData motorUserData;
+bool enabled = false;
+uint32_t rawFrames = 0;
+uint32_t lastCommand = 0;
+
+void onFeedback(const MotorFeedback& feedback, void* context) {
+  auto* data = static_cast<MotorUserData*>(context);
+  data->lastFeedback = feedback;
+  data->receivedFeedback = true;
+  data->lastFeedbackMs = millis();
+}
+void onRawFrame(const CanMsg& frame, void*) {
+  ++rawFrames;
+  if (motorUserData.receivedFeedback) return;
+  Serial.printf("RX %s ID=%lX DLC=%u%s\n", frame.extended ? "EXT" : "STD",
+                (unsigned long)frame.id, frame.length, frame.remote ? " RTR" : "");
+  if (!frame.remote && (frame.id != motorConfig.feedbackId ||
+      frame.extended != motorConfig.feedbackExtended || frame.length != 8)) {
+    Serial.printf("Not feedback match: expecting %s ID=%lX DLC=8\n",
+                  motorConfig.feedbackExtended ? "EXT" : "STD", (unsigned long)motorConfig.feedbackId);
+  }
+}
+void handleConsole() {
+  while (Serial.available()) {
+    const char command = Serial.read();
+    if (command == 'e') {
+      enabled = motor.special(0xFC);
+      Serial.println(enabled ? "Enable queued; sending zero-torque MIT commands" : "Enable enqueue failed");
+    }
+    if (command == 'x') { enabled = false; motor.special(0xFD); }
+    if (command == 'z') motor.special(0xFE);
+    if (command == 'c') motor.special(0xFB);
+  }
+}
+void setup() {
+  Serial.begin(115200);
+  for (int i = 0; i < 30 && !Serial; ++i) delay(100);
+  motor.onFeedback(onFeedback, &motorUserData);
+  motor.onFrame(onRawFrame);
+  if (!motor.begin()) {
+    Serial.printf("CAN initialization failed: %s\n", esp_err_to_name(motor.lastError()));
+    while (true) delay(100);
+  }
+  Serial.printf("CAN TX=%d RX=%d bitrate=%lu commandID=%lX replyID=%lX\n",
+                int(motorConfig.txPin), int(motorConfig.rxPin), (unsigned long)motorConfig.bitrate,
+                (unsigned long)motorConfig.motorId, (unsigned long)motorConfig.feedbackId);
+  Serial.println("Waiting for motor feedback. e=enable, x=disable, z=zero, c=clear errors.");
+  while (!motorUserData.receivedFeedback) {
+    serviceMotor(); // Also send MIT packets and report CAN errors during discovery.
+  }
+  Serial.println("Found motor");
+}
+void serviceMotor() {
+  motor.update(); // Single receive path: do not also call twai_receive() here.
+  handleConsole();
+  if (enabled && uint32_t(millis() - lastCommand) >= 10) {
+    lastCommand = millis();
+    if (!motor.mit(0, 0, 0, 0, 0)) Serial.println("Command enqueue failed");
+  }
+  static uint32_t lastPrint = 0;
+  if (uint32_t(millis() - lastPrint) >= 1000) {
+    lastPrint = millis();
+    twai_status_info_t status = {};
+    if (twai_get_status_info(&status) == ESP_OK) {
+      Serial.printf("CAN state=%d TXerrors=%lu RXerrors=%lu TXfailed=%lu rawRX=%lu\n",
+                    int(status.state), (unsigned long)status.tx_error_counter,
+                    (unsigned long)status.rx_error_counter, (unsigned long)status.tx_failed_count,
+                    (unsigned long)rawFrames);
+    }
+    if (!motorUserData.receivedFeedback) {
+      Serial.println(enabled ? "Waiting for matching reply to MIT commands..." :
+                               "No motor feedback yet. Send e to enable and start zero-torque MIT commands.");
+    } else {
+    const auto& f = motorUserData.lastFeedback;
+    Serial.printf("%s pos=%.4f rad vel=%.3f torque=%.3f Nm temperatures=%d/%d C age=%lu ms\n",
+                  motorStatusName(f.status), f.positionRad, f.velocity, f.torqueNm,
+                  int(f.driverTemperatureC), int(f.motorTemperatureC),
+                  (unsigned long)(millis() - motorUserData.lastFeedbackMs));
+    }
+  }
+  uint32_t alerts;
+  if (twai_read_alerts(&alerts, 0) == ESP_OK) {
+    if (alerts & TWAI_ALERT_BUS_OFF) { enabled = false; Serial.println("CAN bus off"); }
+    if (alerts & TWAI_ALERT_TX_FAILED) Serial.println("CAN TX failed");
+    if (alerts & TWAI_ALERT_RX_QUEUE_FULL) Serial.println("CAN RX queue full");
+  }
+  delay(1);
+}
+
+void loop() { serviceMotor(); }
+
+

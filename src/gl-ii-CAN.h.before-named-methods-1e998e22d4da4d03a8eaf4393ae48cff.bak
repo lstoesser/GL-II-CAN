@@ -1,0 +1,89 @@
+#pragma once
+#include <Arduino.h>
+#include <driver/twai.h>
+
+namespace glii {
+struct Config {
+  gpio_num_t txPin = GPIO_NUM_17;
+  gpio_num_t rxPin = GPIO_NUM_18;
+  uint32_t bitrate = 1000000;
+  uint32_t motorId = 1;
+  uint32_t feedbackId = 1; // Verify against the board's actual reply identifier.
+  bool extended = false;
+  bool feedbackExtended = false;
+  // Explicit IDs: no undocumented mode bits are assumed.
+  uint32_t positionVelocityId = 1;
+  uint32_t velocityId = 1;
+  float positionRange = 12.5f;
+  float velocityRange = 30.0f; // Match the motor parameter page, NOT a guess.
+  float torqueRange = 10.0f;
+  bool singleShot = true;
+};
+struct CanMsg {
+  uint32_t id = 0;
+  uint8_t length = 0;
+  uint8_t data[8] = {};
+  bool extended = false;
+  bool remote = false;
+};
+struct MotorFeedback {
+  uint8_t id = 0, status = 0;
+  float positionRad = 0, velocity = 0, torqueNm = 0;
+  int8_t driverTemperatureC = 0, motorTemperatureC = 0;
+};
+
+struct BusEvents {
+  bool busOff = false;
+  bool txFailed = false;
+  bool rxOverflow = false;
+};
+
+const char* motorStatusName(uint8_t status);
+
+// Owns the ESP32's legacy global TWAI driver. Use one instance per controller.
+// Call from one task, never from an ISR. Callback references last only for the call.
+class GLIICAN {
+public:
+  enum class RequestState { Idle, Pending, Complete, Timeout, SendFailed };
+  using FeedbackCallback = void (*)(const MotorFeedback&, void*);
+  using FrameCallback = void (*)(const CanMsg&, void*);
+  explicit GLIICAN(const Config& config);
+  GLIICAN(const GLIICAN&) = delete;
+  GLIICAN& operator=(const GLIICAN&) = delete;
+  bool begin(); // Installs/starts TWAI; does not enable the motor.
+  esp_err_t lastError() const { return lastError_; }
+  void update(int maxEvents = 32);
+  BusEvents readBusEvents();
+  bool discardPendingCommands();
+  void onReceive(const CanMsg& msg);
+  void onFeedback(FeedbackCallback callback, void* userData = nullptr);
+  void onFrame(FrameCallback callback, void* userData = nullptr);
+  bool sendFrame(const CanMsg& msg); // true = queued, not proof of execution.
+  bool special(uint8_t command);
+  bool mit(float position, float velocity, float kp, float kd, float torque);
+  bool position_velocity(float position, float velocity);
+  bool velocity(float velocity);
+  bool beginRequest(const CanMsg& command, uint32_t replyId, bool extended,
+                    uint8_t replyLength, uint32_t timeoutMs = 100);
+  RequestState requestState() const { return state_; }
+  bool takeReply(CanMsg& msg);
+  void cancelRequest();
+  static uint16_t encode(float value, float lo, float hi, unsigned bits);
+  static float decode(uint16_t value, float lo, float hi, unsigned bits);
+private:
+  bool sendMsg(uint32_t id, uint8_t length, const uint8_t* data);
+  void expire();
+  Config config_;
+  bool started_ = false;
+  esp_err_t lastError_ = ESP_OK;
+  FeedbackCallback feedbackCallback_ = nullptr;
+  FrameCallback frameCallback_ = nullptr;
+  void* feedbackContext_ = nullptr;
+  void* frameContext_ = nullptr;
+  RequestState state_ = RequestState::Idle;
+  CanMsg reply_;
+  uint32_t replyId_ = 0, startedMs_ = 0, timeoutMs_ = 0;
+  bool replyExtended_ = false;
+  uint8_t replyLength_ = 0;
+};
+} // namespace glii
